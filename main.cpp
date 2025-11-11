@@ -8,6 +8,7 @@
 #include <deque>
 #include <thread>
 #include <mutex>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
@@ -20,6 +21,13 @@ std::mutex queue_mtx;
 // When this is true, our main TCP server is connected
 bool isConnected = false;
 
+// This used to notify the writer of an incoming message
+int msg_pipe[2];
+
+// Used to notify the writer of a "backdoor" reset
+int rst_pipe[2];
+
+// Function prototypes
 int  createUdpServer(int port);
 int  createTcpServer(int port);
 void backdoorServer(int sd);
@@ -27,14 +35,16 @@ void udpServer(int sd);
 void execute();
 
 
-// This used to notify the writer of an incoming message
-int message_pipe[2];
 
-// Used to notify the writer of a "backdoor" reset
-int writer_pipe[2];
-
+//=============================================================================
+// Here we just call execute() and catch exceptions.  Any exception that gets
+// thrown is fatal!
+//=============================================================================
 int main(int argc, const char** argv)
 {
+    // Make sure we don't abort if we write to a broken pipe!
+    signal(SIGPIPE, SIG_IGN);
+
     try
     {
         execute();
@@ -46,7 +56,7 @@ int main(int argc, const char** argv)
 
     exit(1);
 }
-
+//=============================================================================
 
 
 
@@ -128,10 +138,10 @@ void execute()
     fd_set rfds;
 
     // Build the pipe that notifies the main thread of a message
-    rc = pipe(message_pipe); if (rc) exit(1);
+    rc = pipe(msg_pipe); if (rc) exit(1);
     
     // Build the pipe that notifies the main thread to reset
-    rc = pipe(writer_pipe); if (rc) exit(1);
+    rc = pipe(rst_pipe); if (rc) exit(1);
 
     // Create the UDP server socket
     sd = createUdpServer(40000);
@@ -159,8 +169,8 @@ WaitForConnection:
     sd = accept(server_sd, nullptr, nullptr);
 
     // Throw away any leftover notifications in the pipes
-    drain(writer_pipe[0]);
-    drain(message_pipe[0]);
+    drain(rst_pipe[0]);
+    drain(msg_pipe[0]);
 
     // We are connected to a peer
     isConnected = true;
@@ -209,29 +219,30 @@ WaitForConnection:
         // close the main input socket and wait for a 
         // new connection
         FD_ZERO(&rfds);
-        FD_SET( writer_pipe[0], &rfds);
-        FD_SET(message_pipe[0], &rfds);
+        FD_SET( rst_pipe[0], &rfds);
+        FD_SET(msg_pipe[0], &rfds);
         FD_SET(             sd, &rfds);
 
-        // Among the writer_pipe, the message_pipe, and the
+        // Among the rst_pipe, the msg_pipe, and the
         // TCP socket, find out who has the largest FD
-        int maxfd = writer_pipe[0];
-        if (message_pipe[0] > maxfd) maxfd = message_pipe[0];
+        int maxfd = rst_pipe[0];
+        if (msg_pipe[0] > maxfd) maxfd = msg_pipe[0];
         if (sd > maxfd) maxfd = sd;
 
         // Wait for a notification to arrive
         select(maxfd+1, &rfds, nullptr, nullptr, nullptr);
 
-        // If we're being told to close the main TCP pipe
+        // If we're being told to close the main TCP pipe,
         // do so, and go wait for another connection
-        if (FD_ISSET(writer_pipe[0], &rfds))
+        if (FD_ISSET(rst_pipe[0], &rfds))
         {
             close(sd);
             goto WaitForConnection;
         }
 
-        // If we're the socket has suddenly become readable,
-        // go wait for another connection
+        // If the socket has suddenly become readable, go wait for another
+        // connection.   A socket becomes readable when the peer writes data
+        // to it or when the peer closes it
         if (FD_ISSET(sd, &rfds))
         {
             close(sd);
@@ -247,21 +258,32 @@ WaitForConnection:
 
 //=============================================================================
 // backdoorServer() - Listens for connections on the "backdoor" TCP port, and 
-//                    when we receive one, it uses "backdoor_pipe" to signal
-//                    then main thread that it should close and reopen the
-//                    TCP server socket
+//                    when we receive one, it uses "rst_pipe" to signal the
+//                    main thread that it should close and reopen the TCP 
+//                    server socket
 //=============================================================================
 void backdoorServer(int sd)
 {
+    int  rc;
     char zero[1] = {0};
 
+    // Start listening to incoming connections
     listen(sd, 2);
 
     while (true)
     {
+        // Wait for an incoming connection
         int newsd = accept(sd, nullptr, nullptr);
+        
+        // Close it immediately
         close(newsd);
-        int rc = write(writer_pipe[1], zero, 1); rc;
+        
+        // If there is a peer connected to our main TCP socket, send a 
+        // notification to close it and wait for a new connection
+        if (isConnected)
+        {
+            rc = write(rst_pipe[1], zero, 1); rc;
+        }
     }
 }
 //=============================================================================
@@ -347,7 +369,7 @@ void udpServer(int sd)
         // that a message is waiting
         if (hasRoom && isConnected)
         {
-            rc = write(message_pipe[1], buffer, 1); rc;
+            rc = write(msg_pipe[1], buffer, 1); rc;
         }
     }
 
